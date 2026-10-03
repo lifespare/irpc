@@ -2,6 +2,15 @@ name: Build unsigned IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      listening:
+        description: 'Show "Listening to" (turn off to go back to "Playing")'
+        type: boolean
+        default: true
+      background_audio:
+        description: 'Enable the audio background mode'
+        type: boolean
+        default: true
 
 jobs:
   build:
@@ -13,6 +22,8 @@ jobs:
         run: xcodebuild -version
 
       - name: Resolve packages, patch DiscordSocialKit, build archive
+        env:
+          LISTENING: ${{ inputs.listening }}
         run: |
           set -eo pipefail
 
@@ -39,7 +50,7 @@ jobs:
           # 2) Patch DiscordSocialKit: look up cover art via Apple's public iTunes
           #    Search API (no MusicKit token needed), fall back to the passed-in link
           python3 - <<'PY'
-          import glob, sys
+          import glob, os, sys
 
           files = glob.glob("SourcePackages/checkouts/DiscordSocialKit/Sources/**/*.swift", recursive=True)
 
@@ -88,12 +99,18 @@ jobs:
 
               '''
 
+          listening = os.environ.get("LISTENING", "true") == "true"
+          print("Listening type enabled:", listening)
+
           done = False
           for f in files:
               s = open(f, encoding="utf-8").read()
               if needle1 in s and needle2 in s:
                   s = s.replace(needle1, patch1, 1)
                   s = s.replace(needle2, helper + needle2, 1)
+                  if listening:
+                      # Show "Listening to Apple Music" instead of "Playing"
+                      s = s.replace("Discord_ActivityTypes_Playing", "Discord_ActivityTypes_Listening")
                   open(f, "w", encoding="utf-8").write(s)
                   print("Patched", f)
                   done = True
@@ -116,19 +133,23 @@ jobs:
             CODE_SIGN_IDENTITY=""
 
       - name: Package IPA
+        env:
+          BG_AUDIO: ${{ inputs.background_audio }}
         run: |
           set -eo pipefail
           APP="$(ls -d build/app.xcarchive/Products/Applications/*.app | head -n1)"
           PLIST="$APP/Info.plist"
 
-          # Turn on the "audio" background mode so iOS keeps the app alive
-          # (the app already plays a silent audio loop, but iOS ignores it
-          # unless this setting is present)
-          /usr/libexec/PlistBuddy -c "Delete :UIBackgroundModes" "$PLIST" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST"
-          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST"
-          echo "Background modes now set to:"
-          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PLIST"
+          if [ "$BG_AUDIO" = "true" ]; then
+            # Turn on the "audio" background mode so iOS keeps the app alive
+            /usr/libexec/PlistBuddy -c "Delete :UIBackgroundModes" "$PLIST" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST"
+            /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST"
+            echo "Background modes now set to:"
+            /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PLIST"
+          else
+            echo "Background audio mode left off"
+          fi
 
           mkdir Payload
           cp -R "$APP" Payload/
