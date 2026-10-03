@@ -36,22 +36,65 @@ jobs:
           # Swift checks packages out as read-only, so unlock them before patching
           chmod -R u+w SourcePackages/checkouts
 
-          # 2) Patch DiscordSocialKit so it uses the artwork URL it is given
+          # 2) Patch DiscordSocialKit: look up cover art via Apple's public iTunes
+          #    Search API (no MusicKit token needed), fall back to the passed-in link
           python3 - <<'PY'
           import glob, sys
+
           files = glob.glob("SourcePackages/checkouts/DiscordSocialKit/Sources/**/*.swift", recursive=True)
-          needle = "if let cachedArtwork = artworkCache[id] {"
-          patch = (
-              "if let passedArtwork = artworkURL, validateAssetURL(passedArtwork) {\n"
-              "\t\t\tartworkCache[id] = passedArtwork\n"
+
+          needle1 = "if let cachedArtwork = artworkCache[id] {"
+          patch1 = (
+              "if artworkCache[id] == nil {\n"
+              "\t\t\tif let itunesArtwork = await fetchITunesArtwork(title: title, artist: artist) {\n"
+              "\t\t\t\tartworkCache[id] = itunesArtwork\n"
+              "\t\t\t} else if let passedArtwork = artworkURL, validateAssetURL(passedArtwork) {\n"
+              "\t\t\t\tartworkCache[id] = passedArtwork\n"
+              "\t\t\t}\n"
               "\t\t}\n"
               "\t\tif let cachedArtwork = artworkCache[id] {"
           )
+
+          needle2 = "private func validateAssetURL(_ url: URL) -> Bool {"
+          helper = r'''private func fetchITunesArtwork(title: String, artist: String) async -> URL? {
+                  var components = URLComponents(string: "https://itunes.apple.com/search")
+                  components?.queryItems = [
+                      URLQueryItem(name: "term", value: "\(title) \(artist)"),
+                      URLQueryItem(name: "media", value: "music"),
+                      URLQueryItem(name: "entity", value: "song"),
+                      URLQueryItem(name: "limit", value: "1"),
+                  ]
+                  guard let searchURL = components?.url else { return nil }
+                  do {
+                      let (data, _) = try await URLSession.shared.data(from: searchURL)
+                      guard
+                          let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let results = json["results"] as? [[String: Any]],
+                          let first = results.first,
+                          let small = first["artworkUrl100"] as? String
+                      else {
+                          print("iTunes artwork lookup: no result for \(title) by \(artist)")
+                          return nil
+                      }
+                      let big = small.replacingOccurrences(of: "100x100bb", with: "600x600bb")
+                      guard let url = URL(string: big), validateAssetURL(url) else { return nil }
+                      print("iTunes artwork found: \(url)")
+                      return url
+                  } catch {
+                      print("iTunes artwork lookup failed: \(error)")
+                      return nil
+                  }
+              }
+
+              '''
+
           done = False
           for f in files:
               s = open(f, encoding="utf-8").read()
-              if needle in s:
-                  open(f, "w", encoding="utf-8").write(s.replace(needle, patch, 1))
+              if needle1 in s and needle2 in s:
+                  s = s.replace(needle1, patch1, 1)
+                  s = s.replace(needle2, helper + needle2, 1)
+                  open(f, "w", encoding="utf-8").write(s)
                   print("Patched", f)
                   done = True
           if not done:
