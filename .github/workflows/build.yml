@@ -27,3 +27,9 @@ jobs:
                    -configuration Release \
                    -derivedDataPath build \
                    CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+
+    - name: Upload IPA Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: iRPC-App
+        path: build/Build/Products/Release-iphoneos/*.ipa
