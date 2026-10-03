@@ -1,35 +1,51 @@
-name: Build iOS App
+name: Build unsigned IPA
 
 on:
-  push:
-    branches: [ main, master, dev ]
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build iOS IPA
     runs-on: macos-latest
-    
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Xcode
-      uses: maxim-lobanov/setup-xcode@v1
-      with:
-        xcode-version: latest-stable
+      - name: Show Xcode version
+        run: xcodebuild -version
 
-    - name: Build App for iOS Device
-      run: |
-        xcodebuild -project iRPC.xcodeproj \
-                   -scheme iRPC \
-                   -sdk iphoneos \
-                   -configuration Release \
-                   -derivedDataPath build \
-                   CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+      - name: Build unsigned archive
+        run: |
+          set -eo pipefail
 
-    - name: Upload IPA Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: iRPC-App
-        path: build/
+          # Find workspace or project
+          if ls -d *.xcworkspace >/dev/null 2>&1; then
+            KIND="-workspace"
+            NAME="$(ls -d *.xcworkspace | head -n1)"
+            SCHEME="$(xcodebuild -list -json -workspace "$NAME" | jq -r '.workspace.schemes[0]')"
+          else
+            KIND="-project"
+            NAME="$(ls -d *.xcodeproj | head -n1)"
+            SCHEME="$(xcodebuild -list -json -project "$NAME" | jq -r '.project.schemes[0]')"
+          fi
+          echo "Using $KIND $NAME, scheme $SCHEME"
+
+          xcodebuild archive \
+            $KIND "$NAME" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/app.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          cp -R build/app.xcarchive/Products/Applications/*.app Payload/
+          zip -r iRPC.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iRPC-ipa
+          path: iRPC.ipa
