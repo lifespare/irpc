@@ -3,12 +3,8 @@ name: Build unsigned IPA
 on:
   workflow_dispatch:
     inputs:
-      listening:
-        description: 'Try "Listening to" instead of "Playing" (experimental)'
-        type: boolean
-        default: true
       debug_banner:
-        description: 'Show a banner in the app with the response from Discord'
+        description: 'Show a banner in the app with the latest Discord status and timestamps'
         type: boolean
         default: true
       background_audio:
@@ -27,7 +23,6 @@ jobs:
 
       - name: Resolve packages, patch code, build archive
         env:
-          LISTENING: ${{ inputs.listening }}
           DEBUG_BANNER: ${{ inputs.debug_banner }}
         run: |
           set -eo pipefail
@@ -52,16 +47,21 @@ jobs:
           # Swift checks packages out as read-only, so unlock them before patching
           chmod -R u+w SourcePackages/checkouts
 
-          # 2) Patch DiscordSocialKit (and optionally ContentView)
+          # 2) Patch code
           python3 - <<'PY'
-          import glob, os, sys
+          import glob, os, re, sys
 
           def sub(s, old, new, label):
               if old not in s:
                   print("WARNING: not found:", label)
                   return s
+              print("OK:", label)
               return s.replace(old, new, 1)
 
+          banner = os.environ.get("DEBUG_BANNER", "false") == "true"
+          print("Debug banner enabled:", banner)
+
+          # ---------- DiscordSocialKit ----------
           files = glob.glob("SourcePackages/checkouts/DiscordSocialKit/Sources/**/*.swift", recursive=True)
 
           needle1 = "if let cachedArtwork = artworkCache[id] {"
@@ -109,10 +109,22 @@ jobs:
 
               '''
 
-          listening = os.environ.get("LISTENING", "false") == "true"
-          banner = os.environ.get("DEBUG_BANNER", "false") == "true"
-          print("Listening type enabled:", listening)
-          print("Debug banner enabled:", banner)
+          reconnect = r'''private var reconnectTask: Task<Void, Never>?
+
+              func scheduleReconnect() {
+                  reconnectTask?.cancel()
+                  reconnectTask = Task { @MainActor in
+                      try? await Task.sleep(nanoseconds: 10_000_000_000)
+                      guard !Task.isCancelled, !self.isAuthenticated else { return }
+                      print("Reconnecting to Discord...")
+                      self.lastPresenceStatus = "Reconnecting to Discord at " + Date().formatted(date: .omitted, time: .standard)
+                      await self.setupWithExistingToken()
+                  }
+              }
+
+              '''
+
+          stamp = 'Date().formatted(date: .omitted, time: .standard)'
 
           done = False
           for f in files:
@@ -121,28 +133,29 @@ jobs:
                   s = s.replace(needle1, patch1, 1)
                   s = s.replace(needle2, helper + needle2, 1)
 
-                  if listening:
-                      # Show "Listening to Apple Music" instead of "Playing"
-                      s = s.replace("Discord_ActivityTypes_Playing", "Discord_ActivityTypes_Listening")
-                      # The package cuts the name "Apple Music" down to 4 bytes; use the full length
-                      s = s.replace("nameStr.size = Int(Int32(4))", 'nameStr.size = Int("Apple Music".utf8.count)')
-
-                  # Remember Discord's answer to each presence update
+                  # Status text shown in the banner
                   s = sub(s, "@Published public private(set) var isAuthorizing = false",
                           "@Published public private(set) var isAuthorizing = false\n\t@Published public var lastPresenceStatus: String? = nil",
                           "status variable")
+
+                  # Reconnect helper
+                  s = sub(s, "public func authorize() {", reconnect + "public func authorize() {", "reconnect helper")
+
+                  # Reconnect when Discord disconnects or errors
+                  s = sub(s, 'print("❌ Client disconnected")',
+                          'print("❌ Client disconnected")\n\t\t\t\tmanager.lastPresenceStatus = "Disconnected from Discord at " + ' + stamp + '\n\t\t\t\tmanager.scheduleReconnect()',
+                          "reconnect on disconnect")
+                  s = sub(s, r'manager.handleError("Connection error \(error): \(errorDetail)")',
+                          r'manager.handleError("Connection error \(error): \(errorDetail)")' + '\n\t\t\t\tmanager.lastPresenceStatus = "Connection error at " + ' + stamp + '\n\t\t\t\tmanager.scheduleReconnect()',
+                          "reconnect on error")
+
+                  # Remember Discord's answer to each presence update
                   s = sub(s, 'print("✅ Rich Presence updated successfully!")',
-                          'print("✅ Rich Presence updated successfully!")\n\t\t\t\t\t\tTask { @MainActor in context.manager.lastPresenceStatus = "Discord accepted the presence update" }',
+                          'print("✅ Rich Presence updated successfully!")\n\t\t\t\t\t\tTask { @MainActor in context.manager.lastPresenceStatus = "Presence accepted at " + ' + stamp + ' }',
                           "success callback")
                   s = sub(s, r'print("❌ Rich Presence update failed: \(errorMessage)")',
                           r'print("❌ Rich Presence update failed: \(errorMessage)")' + '\n\t\t\t\t\t\t\tTask { @MainActor in context.manager.lastPresenceStatus = "Discord rejected it: " + errorMessage }',
                           "error callback")
-                  s = sub(s, 'print("❌ Rich Presence update failed: No error message available")',
-                          'print("❌ Rich Presence update failed: No error message available")\n\t\t\t\t\t\t\tTask { @MainActor in context.manager.lastPresenceStatus = "Discord rejected it (no message given)" }',
-                          "error callback without message")
-                  s = sub(s, 'print("❌ Rich Presence update failed: No result")',
-                          'print("❌ Rich Presence update failed: No result")\n\t\t\t\t\tTask { @MainActor in context.manager.lastPresenceStatus = "No result from Discord" }',
-                          "no result callback")
 
                   open(f, "w", encoding="utf-8").write(s)
                   print("Patched", f)
@@ -150,7 +163,38 @@ jobs:
           if not done:
               sys.exit("ERROR: patch target not found in DiscordSocialKit")
 
-          # Show the banner in the app
+          # ---------- BackgroundController (keep-alive fixes) ----------
+          bg = "iRPC/BackgroundController.swift"
+          if os.path.exists(bg):
+              b = open(bg, encoding="utf-8").read()
+
+              # 1) Don't tear down the silent audio when the short background task expires
+              b, n1 = re.subn(
+                  r'beginBackgroundTask\(withName: "RPCBackgroundTask"\)\s*\{\s*self\.stop\(\)\s*\}',
+                  'beginBackgroundTask(withName: "RPCBackgroundTask") {\n'
+                  '            if self.backgroundTaskID != .invalid {\n'
+                  '                UIApplication.shared.endBackgroundTask(self.backgroundTaskID)\n'
+                  '                self.backgroundTaskID = .invalid\n'
+                  '            }\n'
+                  '        }',
+                  b)
+              print("Background task handler patched:", n1)
+
+              # 2) Always restart the silent audio after an interruption ends
+              b, n2 = re.subn(
+                  r'guard let optionsValue = userInfo\[AVAudioSessionInterruptionOptionKey\] as\? UInt else \{\s*return\s*\}',
+                  'let optionsValue = (userInfo[AVAudioSessionInterruptionOptionKey] as? UInt) ?? 0',
+                  b)
+              print("Interruption options patched:", n2)
+              if "if options.contains(.shouldResume) {" in b:
+                  b = b.replace("if options.contains(.shouldResume) {", "if options.contains(.shouldResume) || true {", 1)
+                  print("shouldResume check relaxed")
+
+              open(bg, "w", encoding="utf-8").write(b)
+          else:
+              print("WARNING: BackgroundController.swift not found at", bg)
+
+          # ---------- ContentView banner ----------
           if banner:
               cv = "iRPC/ContentView.swift"
               if os.path.exists(cv):
