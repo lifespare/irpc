@@ -33,6 +33,9 @@ jobs:
             $KIND "$NAME" \
             -clonedSourcePackagesDirPath SourcePackages
 
+          # Swift checks packages out as read-only, so unlock them before patching
+          chmod -R u+w SourcePackages/checkouts
+
           # 2) Patch DiscordSocialKit so it uses the artwork URL it is given
           python3 - <<'PY'
           import glob, sys
