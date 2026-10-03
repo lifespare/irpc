@@ -21,7 +21,7 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
-      - name: Resolve packages, patch DiscordSocialKit, build archive
+      - name: Resolve packages, inspect SDK, patch DiscordSocialKit, build archive
         env:
           LISTENING: ${{ inputs.listening }}
         run: |
@@ -46,6 +46,27 @@ jobs:
 
           # Swift checks packages out as read-only, so unlock them before patching
           chmod -R u+w SourcePackages/checkouts
+
+          # 1b) Inspect the Discord SDK bundled inside DiscordSocialKit
+          {
+            echo "## Discord SDK info"
+            FW="$(find SourcePackages/checkouts/DiscordSocialKit -name 'discord_partner_sdk.xcframework' | head -n1 || true)"
+            echo "Framework path: ${FW:-not found}"
+            if [ -n "$FW" ]; then
+              echo ""
+              echo "### Version strings found in the binary"
+              BIN="$(find "$FW" -type f -name 'discord_partner_sdk' | head -n1 || true)"
+              if [ -n "$BIN" ]; then
+                strings -a "$BIN" | grep -Eo '1\.[0-9]{1,2}\.[0-9]{4,5}' | sort -u | head -n 10 || true
+              fi
+              echo ""
+              echo "### Activity types in the headers"
+              grep -rhoE 'Discord_ActivityTypes_[A-Za-z]+' "$FW" --include='*.h' | sort -u || true
+              echo ""
+              echo "### Status display types in the headers"
+              grep -rhoE 'Discord_StatusDisplayTypes_[A-Za-z]+' "$FW" --include='*.h' | sort -u || true
+            fi
+          } >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
 
           # 2) Patch DiscordSocialKit: look up cover art via Apple's public iTunes
           #    Search API (no MusicKit token needed), fall back to the passed-in link
