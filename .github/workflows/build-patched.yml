@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       listening:
-        description: 'Show "Listening to" (turn off to go back to "Playing")'
+        description: 'Try "Listening to" instead of "Playing" (experimental)'
         type: boolean
-        default: true
+        default: false
       background_audio:
         description: 'Enable the audio background mode'
         type: boolean
@@ -99,7 +99,7 @@ jobs:
 
               '''
 
-          listening = os.environ.get("LISTENING", "true") == "true"
+          listening = os.environ.get("LISTENING", "false") == "true"
           print("Listening type enabled:", listening)
 
           done = False
@@ -111,6 +111,8 @@ jobs:
                   if listening:
                       # Show "Listening to Apple Music" instead of "Playing"
                       s = s.replace("Discord_ActivityTypes_Playing", "Discord_ActivityTypes_Listening")
+                      # The package cuts the name "Apple Music" down to 4 bytes; use the full length
+                      s = s.replace("nameStr.size = Int(Int32(4))", 'nameStr.size = Int("Apple Music".utf8.count)')
                   open(f, "w", encoding="utf-8").write(s)
                   print("Patched", f)
                   done = True
