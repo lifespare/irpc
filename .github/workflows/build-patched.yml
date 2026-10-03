@@ -1,0 +1,81 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Resolve packages, patch DiscordSocialKit, build archive
+        run: |
+          set -eo pipefail
+
+          # Find workspace or project
+          if ls -d *.xcworkspace >/dev/null 2>&1; then
+            KIND="-workspace"
+            NAME="$(ls -d *.xcworkspace | head -n1)"
+            SCHEME="$(xcodebuild -list -json -workspace "$NAME" | jq -r '.workspace.schemes[0]')"
+          else
+            KIND="-project"
+            NAME="$(ls -d *.xcodeproj | head -n1)"
+            SCHEME="$(xcodebuild -list -json -project "$NAME" | jq -r '.project.schemes[0]')"
+          fi
+          echo "Using $KIND $NAME, scheme $SCHEME"
+
+          # 1) Download Swift packages into ./SourcePackages
+          xcodebuild -resolvePackageDependencies \
+            $KIND "$NAME" \
+            -clonedSourcePackagesDirPath SourcePackages
+
+          # 2) Patch DiscordSocialKit so it uses the artwork URL it is given
+          python3 - <<'PY'
+          import glob, sys
+          files = glob.glob("SourcePackages/checkouts/DiscordSocialKit/Sources/**/*.swift", recursive=True)
+          needle = "if let cachedArtwork = artworkCache[id] {"
+          patch = (
+              "if let passedArtwork = artworkURL, validateAssetURL(passedArtwork) {\n"
+              "\t\t\tartworkCache[id] = passedArtwork\n"
+              "\t\t}\n"
+              "\t\tif let cachedArtwork = artworkCache[id] {"
+          )
+          done = False
+          for f in files:
+              s = open(f, encoding="utf-8").read()
+              if needle in s:
+                  open(f, "w", encoding="utf-8").write(s.replace(needle, patch, 1))
+                  print("Patched", f)
+                  done = True
+          if not done:
+              sys.exit("ERROR: patch target not found in DiscordSocialKit")
+          PY
+
+          # 3) Build using the patched packages
+          xcodebuild archive \
+            $KIND "$NAME" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/app.xcarchive \
+            -clonedSourcePackagesDirPath SourcePackages \
+            -disableAutomaticPackageResolution \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          cp -R build/app.xcarchive/Products/Applications/*.app Payload/
+          zip -r iRPC.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iRPC-ipa
+          path: iRPC.ipa
