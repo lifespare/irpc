@@ -6,7 +6,11 @@ on:
       listening:
         description: 'Try "Listening to" instead of "Playing" (experimental)'
         type: boolean
-        default: false
+        default: true
+      debug_banner:
+        description: 'Show a banner in the app with the response from Discord'
+        type: boolean
+        default: true
       background_audio:
         description: 'Enable the audio background mode'
         type: boolean
@@ -21,9 +25,10 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
-      - name: Resolve packages, inspect SDK, patch DiscordSocialKit, build archive
+      - name: Resolve packages, patch code, build archive
         env:
           LISTENING: ${{ inputs.listening }}
+          DEBUG_BANNER: ${{ inputs.debug_banner }}
         run: |
           set -eo pipefail
 
@@ -47,31 +52,15 @@ jobs:
           # Swift checks packages out as read-only, so unlock them before patching
           chmod -R u+w SourcePackages/checkouts
 
-          # 1b) Inspect the Discord SDK bundled inside DiscordSocialKit
-          {
-            echo "## Discord SDK info"
-            FW="$(find SourcePackages/checkouts/DiscordSocialKit -name 'discord_partner_sdk.xcframework' | head -n1 || true)"
-            echo "Framework path: ${FW:-not found}"
-            if [ -n "$FW" ]; then
-              echo ""
-              echo "### Version strings found in the binary"
-              BIN="$(find "$FW" -type f -name 'discord_partner_sdk' | head -n1 || true)"
-              if [ -n "$BIN" ]; then
-                strings -a "$BIN" | grep -Eo '1\.[0-9]{1,2}\.[0-9]{4,5}' | sort -u | head -n 10 || true
-              fi
-              echo ""
-              echo "### Activity types in the headers"
-              grep -rhoE 'Discord_ActivityTypes_[A-Za-z]+' "$FW" --include='*.h' | sort -u || true
-              echo ""
-              echo "### Status display types in the headers"
-              grep -rhoE 'Discord_StatusDisplayTypes_[A-Za-z]+' "$FW" --include='*.h' | sort -u || true
-            fi
-          } >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
-
-          # 2) Patch DiscordSocialKit: look up cover art via Apple's public iTunes
-          #    Search API (no MusicKit token needed), fall back to the passed-in link
+          # 2) Patch DiscordSocialKit (and optionally ContentView)
           python3 - <<'PY'
           import glob, os, sys
+
+          def sub(s, old, new, label):
+              if old not in s:
+                  print("WARNING: not found:", label)
+                  return s
+              return s.replace(old, new, 1)
 
           files = glob.glob("SourcePackages/checkouts/DiscordSocialKit/Sources/**/*.swift", recursive=True)
 
@@ -121,7 +110,9 @@ jobs:
               '''
 
           listening = os.environ.get("LISTENING", "false") == "true"
+          banner = os.environ.get("DEBUG_BANNER", "false") == "true"
           print("Listening type enabled:", listening)
+          print("Debug banner enabled:", banner)
 
           done = False
           for f in files:
@@ -129,16 +120,59 @@ jobs:
               if needle1 in s and needle2 in s:
                   s = s.replace(needle1, patch1, 1)
                   s = s.replace(needle2, helper + needle2, 1)
+
                   if listening:
                       # Show "Listening to Apple Music" instead of "Playing"
                       s = s.replace("Discord_ActivityTypes_Playing", "Discord_ActivityTypes_Listening")
                       # The package cuts the name "Apple Music" down to 4 bytes; use the full length
                       s = s.replace("nameStr.size = Int(Int32(4))", 'nameStr.size = Int("Apple Music".utf8.count)')
+
+                  # Remember Discord's answer to each presence update
+                  s = sub(s, "@Published public private(set) var isAuthorizing = false",
+                          "@Published public private(set) var isAuthorizing = false\n\t@Published public var lastPresenceStatus: String? = nil",
+                          "status variable")
+                  s = sub(s, 'print("✅ Rich Presence updated successfully!")',
+                          'print("✅ Rich Presence updated successfully!")\n\t\t\t\t\t\tTask { @MainActor in context.manager.lastPresenceStatus = "Discord accepted the presence update" }',
+                          "success callback")
+                  s = sub(s, r'print("❌ Rich Presence update failed: \(errorMessage)")',
+                          r'print("❌ Rich Presence update failed: \(errorMessage)")' + '\n\t\t\t\t\t\t\tTask { @MainActor in context.manager.lastPresenceStatus = "Discord rejected it: " + errorMessage }',
+                          "error callback")
+                  s = sub(s, 'print("❌ Rich Presence update failed: No error message available")',
+                          'print("❌ Rich Presence update failed: No error message available")\n\t\t\t\t\t\t\tTask { @MainActor in context.manager.lastPresenceStatus = "Discord rejected it (no message given)" }',
+                          "error callback without message")
+                  s = sub(s, 'print("❌ Rich Presence update failed: No result")',
+                          'print("❌ Rich Presence update failed: No result")\n\t\t\t\t\tTask { @MainActor in context.manager.lastPresenceStatus = "No result from Discord" }',
+                          "no result callback")
+
                   open(f, "w", encoding="utf-8").write(s)
                   print("Patched", f)
                   done = True
           if not done:
               sys.exit("ERROR: patch target not found in DiscordSocialKit")
+
+          # Show the banner in the app
+          if banner:
+              cv = "iRPC/ContentView.swift"
+              if os.path.exists(cv):
+                  t = open(cv, encoding="utf-8").read()
+                  old = '.navigationTitle("iRPC")'
+                  new = old + '''
+                      .safeAreaInset(edge: .bottom) {
+                          if let status = discord.lastPresenceStatus {
+                              Text(status)
+                                  .font(.caption)
+                                  .padding(8)
+                                  .frame(maxWidth: .infinity)
+                                  .background(.ultraThinMaterial)
+                          }
+                      }'''
+                  if old in t:
+                      open(cv, "w", encoding="utf-8").write(t.replace(old, new, 1))
+                      print("Banner added to ContentView")
+                  else:
+                      print("WARNING: could not add banner (navigationTitle not found)")
+              else:
+                  print("WARNING: ContentView.swift not found at", cv)
           PY
 
           # 3) Build using the patched packages
