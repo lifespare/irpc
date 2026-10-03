@@ -117,8 +117,21 @@ jobs:
 
       - name: Package IPA
         run: |
+          set -eo pipefail
+          APP="$(ls -d build/app.xcarchive/Products/Applications/*.app | head -n1)"
+          PLIST="$APP/Info.plist"
+
+          # Turn on the "audio" background mode so iOS keeps the app alive
+          # (the app already plays a silent audio loop, but iOS ignores it
+          # unless this setting is present)
+          /usr/libexec/PlistBuddy -c "Delete :UIBackgroundModes" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST"
+          echo "Background modes now set to:"
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PLIST"
+
           mkdir Payload
-          cp -R build/app.xcarchive/Products/Applications/*.app Payload/
+          cp -R "$APP" Payload/
           zip -r iRPC.ipa Payload
 
       - uses: actions/upload-artifact@v4
