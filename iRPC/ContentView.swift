@@ -482,13 +482,21 @@ struct ContentView: View {
     }
 
     private func updateDiscordDirectly(with playback: NowPlayingData) {
+        let key = "\(playback.artist)|\(playback.title)"
+        var art = playback.artworkURL
+        if art == nil {
+            art = ArtworkLookup.shared.url(for: key)
+            if art == nil {
+                ArtworkLookup.shared.fetch(key: key, title: playback.title, artist: playback.artist)
+            }
+        }
         discord.updateCurrentPlayback(
             id: playback.id,
             title: playback.title,
             artist: playback.artist,
             duration: playback.duration,
             currentTime: playback.playbackTime,
-            artworkURL: playback.artworkURL
+            artworkURL: art
         )
     }
 
@@ -568,5 +576,65 @@ extension View {
         let minutes = Int(time) / 60
         let seconds = Int(time) % 60
         return String(format: "%02d:%02d", minutes, seconds)
+    }
+}
+
+// MARK: - Artwork lookup (fallback when MusicKit gives no artwork)
+
+final class ArtworkLookup: @unchecked Sendable {
+    static let shared = ArtworkLookup()
+
+    private var cache: [String: URL] = [:]
+    private var inFlight: Set<String> = []
+    private var failed: Set<String> = []
+    private let lock = NSLock()
+
+    func url(for key: String) -> URL? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cache[key]
+    }
+
+    private func begin(_ key: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if cache[key] != nil || inFlight.contains(key) || failed.contains(key) {
+            return false
+        }
+        inFlight.insert(key)
+        return true
+    }
+
+    private func finish(_ key: String, url: URL?) {
+        lock.lock()
+        defer { lock.unlock() }
+        inFlight.remove(key)
+        if let url = url {
+            cache[key] = url
+        } else {
+            failed.insert(key)
+        }
+    }
+
+    func fetch(key: String, title: String, artist: String) {
+        guard begin(key) else { return }
+
+        Task.detached {
+            var result: URL? = nil
+            var components = URLComponents(string: "https://itunes.apple.com/search")!
+            components.queryItems = [
+                URLQueryItem(name: "term", value: "\(artist) \(title)"),
+                URLQueryItem(name: "entity", value: "song"),
+                URLQueryItem(name: "limit", value: "1")
+            ]
+            if let searchURL = components.url,
+               let (data, _) = try? await URLSession.shared.data(from: searchURL),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let first = (json["results"] as? [[String: Any]])?.first,
+               let art = first["artworkUrl100"] as? String {
+                result = URL(string: art.replacingOccurrences(of: "100x100bb", with: "600x600bb"))
+            }
+            self.finish(key, url: result)
+        }
     }
 }
