@@ -3,6 +3,18 @@ name: Build unsigned IPA
 on:
   workflow_dispatch:
     inputs:
+      discord_app_id:
+        description: 'Your own Discord Application ID (digits only). Leave empty to keep the original one.'
+        type: string
+        default: ''
+      listening:
+        description: 'Show "Listening to Apple Music" with progress bar'
+        type: boolean
+        default: true
+      small_badge:
+        description: 'Add the small Apple Music badge on the cover (needs an art asset named applemusic)'
+        type: boolean
+        default: false
       debug_banner:
         description: 'Show a banner in the app with the latest Discord status and timestamps'
         type: boolean
@@ -23,6 +35,9 @@ jobs:
 
       - name: Resolve packages, patch code, build archive
         env:
+          APP_ID: ${{ inputs.discord_app_id }}
+          LISTENING: ${{ inputs.listening }}
+          SMALL_BADGE: ${{ inputs.small_badge }}
           DEBUG_BANNER: ${{ inputs.debug_banner }}
         run: |
           set -eo pipefail
@@ -51,15 +66,42 @@ jobs:
           python3 - <<'PY'
           import glob, os, re, sys
 
-          def sub(s, old, new, label):
+          def sub(s, old, new, label, count=1):
               if old not in s:
                   print("WARNING: not found:", label)
                   return s
               print("OK:", label)
-              return s.replace(old, new, 1)
+              return s.replace(old, new, count)
 
+          app_id = os.environ.get("APP_ID", "").strip()
+          listening = os.environ.get("LISTENING", "false") == "true"
+          small_badge = os.environ.get("SMALL_BADGE", "false") == "true"
           banner = os.environ.get("DEBUG_BANNER", "false") == "true"
-          print("Debug banner enabled:", banner)
+          print("Custom app ID:", app_id or "(none, keeping original)")
+          print("Listening:", listening, "| Small badge:", small_badge, "| Banner:", banner)
+
+          # ---------- Replace the Discord application ID everywhere ----------
+          OLD_ID = "1370062110272520313"
+          if app_id:
+              if not re.fullmatch(r"[0-9]{15,25}", app_id):
+                  sys.exit("ERROR: the Discord Application ID must be digits only")
+              changed = []
+              for root, dirs, fnames in os.walk("."):
+                  dirs[:] = [d for d in dirs if d not in (".git", "SourcePackages", "build", "Payload")]
+                  for fn in fnames:
+                      if fn.endswith((".swift", ".plist", ".pbxproj", ".xcconfig", ".entitlements", ".xcscheme")):
+                          p = os.path.join(root, fn)
+                          try:
+                              txt = open(p, encoding="utf-8").read()
+                          except Exception:
+                              continue
+                          new = txt.replace("1_370_062_110_272_520_313", app_id).replace(OLD_ID, app_id)
+                          if new != txt:
+                              open(p, "w", encoding="utf-8").write(new)
+                              changed.append(p)
+              print("App ID replaced in:", changed)
+              if not changed:
+                  print("WARNING: the old app ID was not found in any file")
 
           # ---------- DiscordSocialKit ----------
           files = glob.glob("SourcePackages/checkouts/DiscordSocialKit/Sources/**/*.swift", recursive=True)
@@ -67,7 +109,7 @@ jobs:
           needle1 = "if let cachedArtwork = artworkCache[id] {"
           patch1 = (
               "if artworkCache[id] == nil {\n"
-              "\t\t\tif let itunesArtwork = await fetchITunesArtwork(title: title, artist: artist) {\n"
+              "\t\t\tif let itunesArtwork = await fetchITunesArtwork(id: id, title: title, artist: artist) {\n"
               "\t\t\t\tartworkCache[id] = itunesArtwork\n"
               "\t\t\t} else if let passedArtwork = artworkURL, validateAssetURL(passedArtwork) {\n"
               "\t\t\t\tartworkCache[id] = passedArtwork\n"
@@ -77,7 +119,7 @@ jobs:
           )
 
           needle2 = "private func validateAssetURL(_ url: URL) -> Bool {"
-          helper = r'''private func fetchITunesArtwork(title: String, artist: String) async -> URL? {
+          helper = r'''private func fetchITunesArtwork(id: String, title: String, artist: String) async -> URL? {
                   var components = URLComponents(string: "https://itunes.apple.com/search")
                   components?.queryItems = [
                       URLQueryItem(name: "term", value: "\(title) \(artist)"),
@@ -97,6 +139,9 @@ jobs:
                           print("iTunes artwork lookup: no result for \(title) by \(artist)")
                           return nil
                       }
+                      if let album = first["collectionName"] as? String {
+                          albumCache[id] = album
+                      }
                       let big = small.replacingOccurrences(of: "100x100bb", with: "600x600bb")
                       guard let url = URL(string: big), validateAssetURL(url) else { return nil }
                       print("iTunes artwork found: \(url)")
@@ -109,7 +154,9 @@ jobs:
 
               '''
 
-          reconnect = r'''private var reconnectTask: Task<Void, Never>?
+          extras = r'''private var albumCache: [String: String] = [:]
+
+              private var reconnectTask: Task<Void, Never>?
 
               func scheduleReconnect() {
                   reconnectTask?.cancel()
@@ -133,15 +180,31 @@ jobs:
                   s = s.replace(needle1, patch1, 1)
                   s = s.replace(needle2, helper + needle2, 1)
 
-                  # Status text shown in the banner
+                  # Album name as the third line
+                  s = sub(s, r'makeDiscordString(from: "\(title) by \(artist)")',
+                          r'makeDiscordString(from: albumCache[id] ?? "\(title) by \(artist)")',
+                          "album line", count=-1)
+
+                  if listening:
+                      s = s.replace("Discord_ActivityTypes_Playing", "Discord_ActivityTypes_Listening")
+                      s = sub(s, "nameStr.size = Int(Int32(4))",
+                              'nameStr.size = Int("Apple Music".utf8.count)', "full name length")
+
+                  if small_badge:
+                      s = sub(s, "Discord_Activity_SetAssets(&activity, &assets)",
+                              'var smallImageStr = makeDiscordString(from: "applemusic")\n'
+                              '\t\tvar smallTextStr = makeDiscordString(from: "Apple Music")\n'
+                              '\t\tDiscord_ActivityAssets_SetSmallImage(&assets, &smallImageStr)\n'
+                              '\t\tDiscord_ActivityAssets_SetSmallText(&assets, &smallTextStr)\n'
+                              '\t\tDiscord_Activity_SetAssets(&activity, &assets)',
+                              "small badge")
+
                   s = sub(s, "@Published public private(set) var isAuthorizing = false",
                           "@Published public private(set) var isAuthorizing = false\n\t@Published public var lastPresenceStatus: String? = nil",
                           "status variable")
 
-                  # Reconnect helper
-                  s = sub(s, "public func authorize() {", reconnect + "public func authorize() {", "reconnect helper")
+                  s = sub(s, "public func authorize() {", extras + "public func authorize() {", "reconnect helper")
 
-                  # Reconnect when Discord disconnects or errors
                   s = sub(s, 'print("❌ Client disconnected")',
                           'print("❌ Client disconnected")\n\t\t\t\tmanager.lastPresenceStatus = "Disconnected from Discord at " + ' + stamp + '\n\t\t\t\tmanager.scheduleReconnect()',
                           "reconnect on disconnect")
@@ -149,7 +212,6 @@ jobs:
                           r'manager.handleError("Connection error \(error): \(errorDetail)")' + '\n\t\t\t\tmanager.lastPresenceStatus = "Connection error at " + ' + stamp + '\n\t\t\t\tmanager.scheduleReconnect()',
                           "reconnect on error")
 
-                  # Remember Discord's answer to each presence update
                   s = sub(s, 'print("✅ Rich Presence updated successfully!")',
                           'print("✅ Rich Presence updated successfully!")\n\t\t\t\t\t\tTask { @MainActor in context.manager.lastPresenceStatus = "Presence accepted at " + ' + stamp + ' }',
                           "success callback")
@@ -167,8 +229,6 @@ jobs:
           bg = "iRPC/BackgroundController.swift"
           if os.path.exists(bg):
               b = open(bg, encoding="utf-8").read()
-
-              # 1) Don't tear down the silent audio when the short background task expires
               b, n1 = re.subn(
                   r'beginBackgroundTask\(withName: "RPCBackgroundTask"\)\s*\{\s*self\.stop\(\)\s*\}',
                   'beginBackgroundTask(withName: "RPCBackgroundTask") {\n'
@@ -179,8 +239,6 @@ jobs:
                   '        }',
                   b)
               print("Background task handler patched:", n1)
-
-              # 2) Always restart the silent audio after an interruption ends
               b, n2 = re.subn(
                   r'guard let optionsValue = userInfo\[AVAudioSessionInterruptionOptionKey\] as\? UInt else \{\s*return\s*\}',
                   'let optionsValue = (userInfo[AVAudioSessionInterruptionOptionKey] as? UInt) ?? 0',
@@ -189,7 +247,6 @@ jobs:
               if "if options.contains(.shouldResume) {" in b:
                   b = b.replace("if options.contains(.shouldResume) {", "if options.contains(.shouldResume) || true {", 1)
                   print("shouldResume check relaxed")
-
               open(bg, "w", encoding="utf-8").write(b)
           else:
               print("WARNING: BackgroundController.swift not found at", bg)
