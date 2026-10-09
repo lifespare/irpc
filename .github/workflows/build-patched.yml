@@ -3,12 +3,12 @@ name: Build unsigned IPA
 on:
   workflow_dispatch:
     inputs:
-      discord_app_id:
-        description: 'Your own Discord Application ID (digits only). Leave empty to keep the original one.'
-        type: string
-        default: ''
-      listening:
-        description: 'Show "Listening to Apple Music" with progress bar'
+      progress_text:
+        description: 'Show track progress in the status (e.g. 2:14 ▰▰▰▰▱▱ 3:25) and update every 5 seconds'
+        type: boolean
+        default: true
+      max_keep_alive:
+        description: 'Maximum keep-alive (background location + stronger audio + 30s health check). Uses more battery.'
         type: boolean
         default: true
       small_badge:
@@ -23,6 +23,10 @@ on:
         description: 'Enable the audio background mode'
         type: boolean
         default: true
+      discord_app_id:
+        description: 'Optional: your own Discord Application ID (digits only). Leave empty to keep the original one.'
+        type: string
+        default: ''
 
 jobs:
   build:
@@ -36,7 +40,8 @@ jobs:
       - name: Resolve packages, patch code, build archive
         env:
           APP_ID: ${{ inputs.discord_app_id }}
-          LISTENING: ${{ inputs.listening }}
+          PROGRESS_TEXT: ${{ inputs.progress_text }}
+          MAX_KEEP_ALIVE: ${{ inputs.max_keep_alive }}
           SMALL_BADGE: ${{ inputs.small_badge }}
           DEBUG_BANNER: ${{ inputs.debug_banner }}
         run: |
@@ -74,13 +79,14 @@ jobs:
               return s.replace(old, new, count)
 
           app_id = os.environ.get("APP_ID", "").strip()
-          listening = os.environ.get("LISTENING", "false") == "true"
+          progress = os.environ.get("PROGRESS_TEXT", "false") == "true"
+          max_alive = os.environ.get("MAX_KEEP_ALIVE", "false") == "true"
           small_badge = os.environ.get("SMALL_BADGE", "false") == "true"
           banner = os.environ.get("DEBUG_BANNER", "false") == "true"
           print("Custom app ID:", app_id or "(none, keeping original)")
-          print("Listening:", listening, "| Small badge:", small_badge, "| Banner:", banner)
+          print("Progress:", progress, "| Max keep-alive:", max_alive, "| Small badge:", small_badge, "| Banner:", banner)
 
-          # ---------- Replace the Discord application ID everywhere ----------
+          # ---------- Optional: replace the Discord application ID ----------
           OLD_ID = "1370062110272520313"
           if app_id:
               if not re.fullmatch(r"[0-9]{15,25}", app_id):
@@ -100,8 +106,6 @@ jobs:
                               open(p, "w", encoding="utf-8").write(new)
                               changed.append(p)
               print("App ID replaced in:", changed)
-              if not changed:
-                  print("WARNING: the old app ID was not found in any file")
 
           # ---------- DiscordSocialKit ----------
           files = glob.glob("SourcePackages/checkouts/DiscordSocialKit/Sources/**/*.swift", recursive=True)
@@ -171,6 +175,19 @@ jobs:
 
               '''
 
+          state_helper = r'''let stateText: String = {
+                      func fmt(_ t: TimeInterval) -> String {
+                          let s = max(0, Int(t))
+                          return String(format: "%d:%02d", s / 60, s % 60)
+                      }
+                      let total = max(duration, 1)
+                      let ratio = min(max(currentTime / total, 0), 1)
+                      let filled = Int((ratio * 10).rounded())
+                      let bar = String(repeating: "▰", count: filled) + String(repeating: "▱", count: 10 - filled)
+                      return "by \(artist) • \(fmt(currentTime)) \(bar) \(fmt(duration))"
+                  }()
+                  '''
+
           stamp = 'Date().formatted(date: .omitted, time: .standard)'
 
           done = False
@@ -180,15 +197,21 @@ jobs:
                   s = s.replace(needle1, patch1, 1)
                   s = s.replace(needle2, helper + needle2, 1)
 
-                  # Album name as the third line
+                  # Album name as the hover text on the cover
                   s = sub(s, r'makeDiscordString(from: "\(title) by \(artist)")',
                           r'makeDiscordString(from: albumCache[id] ?? "\(title) by \(artist)")',
                           "album line", count=-1)
 
-                  if listening:
-                      s = s.replace("Discord_ActivityTypes_Playing", "Discord_ActivityTypes_Listening")
-                      s = sub(s, "nameStr.size = Int(Int32(4))",
-                              'nameStr.size = Int("Apple Music".utf8.count)', "full name length")
+                  if progress:
+                      s = sub(s, r'let statePtr = makeStringBuffer(from: "by \(artist)").ptr',
+                              state_helper + r'let statePtr = makeStringBuffer(from: stateText).ptr',
+                              "progress text (pointer)")
+                      s = sub(s, r'stateStr.size = Int(Int32(("by \(artist)").utf8.count))',
+                              r'stateStr.size = Int(Int32(stateText.utf8.count))',
+                              "progress text (size)")
+                      s = sub(s, "private let presenceUpdateInterval: TimeInterval = 15",
+                              "private let presenceUpdateInterval: TimeInterval = 5",
+                              "update every 5 seconds")
 
                   if small_badge:
                       s = sub(s, "Discord_Activity_SetAssets(&activity, &assets)",
@@ -225,10 +248,12 @@ jobs:
           if not done:
               sys.exit("ERROR: patch target not found in DiscordSocialKit")
 
-          # ---------- BackgroundController (keep-alive fixes) ----------
+          # ---------- BackgroundController (keep-alive) ----------
           bg = "iRPC/BackgroundController.swift"
           if os.path.exists(bg):
               b = open(bg, encoding="utf-8").read()
+
+              # Don't tear down the silent audio when the short background task expires
               b, n1 = re.subn(
                   r'beginBackgroundTask\(withName: "RPCBackgroundTask"\)\s*\{\s*self\.stop\(\)\s*\}',
                   'beginBackgroundTask(withName: "RPCBackgroundTask") {\n'
@@ -239,6 +264,8 @@ jobs:
                   '        }',
                   b)
               print("Background task handler patched:", n1)
+
+              # Always restart the silent audio after an interruption ends
               b, n2 = re.subn(
                   r'guard let optionsValue = userInfo\[AVAudioSessionInterruptionOptionKey\] as\? UInt else \{\s*return\s*\}',
                   'let optionsValue = (userInfo[AVAudioSessionInterruptionOptionKey] as? UInt) ?? 0',
@@ -247,6 +274,82 @@ jobs:
               if "if options.contains(.shouldResume) {" in b:
                   b = b.replace("if options.contains(.shouldResume) {", "if options.contains(.shouldResume) || true {", 1)
                   print("shouldResume check relaxed")
+
+              if max_alive:
+                  # Health check every 30 seconds instead of every 5 minutes
+                  b = sub(b, "withTimeInterval: 5 * 60", "withTimeInterval: 30", "30s health check")
+                  b = sub(b, "keepAliveTimer?.tolerance = 30", "keepAliveTimer?.tolerance = 5", "timer tolerance")
+
+                  # No more keep-alive notification banners
+                  b, n3 = re.subn(r'^[ \t]*sendSilentKeepAliveNotification\(\)[ \t]*$', '', b, flags=re.M)
+                  print("Keep-alive notification calls removed:", n3)
+
+                  # Very quiet (but not exactly zero) audio, at normal volume
+                  b = sub(b, "playerNode.volume = 0.0", "playerNode.volume = 1.0", "player volume")
+                  b = sub(b, "mixer.volume = 0.0", "mixer.volume = 1.0", "mixer volume")
+                  b = sub(b, "channelData[frame] = 0.0",
+                          "channelData[frame] = (frame % 2 == 0) ? 0.00003 : -0.00003",
+                          "near-silent samples")
+
+                  # Restart the audio engine when iOS reconfigures it (headphones, routes...)
+                  b = sub(b, "self.engine = engine\n",
+                          "self.engine = engine\n"
+                          "            NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in\n"
+                          "                self?.restartAudioEngine()\n"
+                          "            }\n",
+                          "engine configuration change observer")
+
+                  # Background location keep-alive
+                  b = sub(b, "import AVFoundation", "import AVFoundation\nimport CoreLocation", "CoreLocation import")
+                  b, n4 = re.subn(r'(func start\(\) \{\s*guard !isRunning else \{ return \})',
+                                  r'\1\n        LocationKeepAlive.shared.start()', b)
+                  b, n5 = re.subn(r'(func stop\(\) \{\s*guard isRunning else \{ return \})',
+                                  r'\1\n        LocationKeepAlive.shared.stop()', b)
+                  print("Location hooks added (start/stop):", n4, n5)
+
+                  b += r'''
+
+          final class LocationKeepAlive: NSObject, CLLocationManagerDelegate {
+              static let shared = LocationKeepAlive()
+              private var manager: CLLocationManager?
+
+              func start() {
+                  DispatchQueue.main.async {
+                      if self.manager == nil {
+                          let m = CLLocationManager()
+                          m.delegate = self
+                          m.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+                          m.distanceFilter = kCLDistanceFilterNone
+                          m.pausesLocationUpdatesAutomatically = false
+                          m.allowsBackgroundLocationUpdates = true
+                          m.showsBackgroundLocationIndicator = true
+                          self.manager = m
+                      }
+                      self.manager?.requestWhenInUseAuthorization()
+                      self.manager?.startUpdatingLocation()
+                  }
+              }
+
+              func stop() {
+                  DispatchQueue.main.async {
+                      self.manager?.stopUpdatingLocation()
+                  }
+              }
+
+              func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+                  switch manager.authorizationStatus {
+                  case .authorizedAlways, .authorizedWhenInUse:
+                      manager.startUpdatingLocation()
+                  default:
+                      break
+                  }
+              }
+
+              func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {}
+              func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {}
+          }
+          '''
+
               open(bg, "w", encoding="utf-8").write(b)
           else:
               print("WARNING: BackgroundController.swift not found at", bg)
@@ -293,20 +396,33 @@ jobs:
       - name: Package IPA
         env:
           BG_AUDIO: ${{ inputs.background_audio }}
+          MAX_KEEP_ALIVE: ${{ inputs.max_keep_alive }}
         run: |
           set -eo pipefail
           APP="$(ls -d build/app.xcarchive/Products/Applications/*.app | head -n1)"
           PLIST="$APP/Info.plist"
+          PB=/usr/libexec/PlistBuddy
 
-          if [ "$BG_AUDIO" = "true" ]; then
-            # Turn on the "audio" background mode so iOS keeps the app alive
-            /usr/libexec/PlistBuddy -c "Delete :UIBackgroundModes" "$PLIST" 2>/dev/null || true
-            /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST"
-            /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST"
+          if [ "$BG_AUDIO" = "true" ] || [ "$MAX_KEEP_ALIVE" = "true" ]; then
+            $PB -c "Delete :UIBackgroundModes" "$PLIST" 2>/dev/null || true
+            $PB -c "Add :UIBackgroundModes array" "$PLIST"
+            IDX=0
+            if [ "$BG_AUDIO" = "true" ]; then
+              $PB -c "Add :UIBackgroundModes:$IDX string audio" "$PLIST"
+              IDX=$((IDX+1))
+            fi
+            if [ "$MAX_KEEP_ALIVE" = "true" ]; then
+              $PB -c "Add :UIBackgroundModes:$IDX string location" "$PLIST"
+              IDX=$((IDX+1))
+              $PB -c "Delete :NSLocationWhenInUseUsageDescription" "$PLIST" 2>/dev/null || true
+              $PB -c "Add :NSLocationWhenInUseUsageDescription string Used only to keep iRPC running in the background so your Discord status stays up." "$PLIST"
+              $PB -c "Delete :NSLocationAlwaysAndWhenInUseUsageDescription" "$PLIST" 2>/dev/null || true
+              $PB -c "Add :NSLocationAlwaysAndWhenInUseUsageDescription string Used only to keep iRPC running in the background so your Discord status stays up." "$PLIST"
+            fi
             echo "Background modes now set to:"
-            /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PLIST"
+            $PB -c "Print :UIBackgroundModes" "$PLIST"
           else
-            echo "Background audio mode left off"
+            echo "Background modes left unchanged"
           fi
 
           mkdir Payload
