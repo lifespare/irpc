@@ -3,12 +3,20 @@ name: Build unsigned IPA
 on:
   workflow_dispatch:
     inputs:
+      update_seconds:
+        description: 'How often to send an update to Discord, in seconds (5 recommended, 3 to 15 allowed)'
+        type: string
+        default: '5'
       progress_text:
-        description: 'Show track progress in the status (e.g. 2:14 ▰▰▰▰▱▱ 3:25) and update every 5 seconds'
+        description: 'Add a text progress bar to the status line (e.g. 2:14 ▰▰▰▰▱▱ 3:25). Leave off for the clean look.'
         type: boolean
-        default: true
+        default: false
       max_keep_alive:
         description: 'Maximum keep-alive (background location + stronger audio + 30s health check). Uses more battery.'
+        type: boolean
+        default: true
+      hide_location_indicator:
+        description: 'Ask for Always location access and hide the blue location arrow (then set iRPC to Always in Settings)'
         type: boolean
         default: true
       small_badge:
@@ -41,7 +49,9 @@ jobs:
         env:
           APP_ID: ${{ inputs.discord_app_id }}
           PROGRESS_TEXT: ${{ inputs.progress_text }}
+          UPDATE_SECONDS: ${{ inputs.update_seconds }}
           MAX_KEEP_ALIVE: ${{ inputs.max_keep_alive }}
+          HIDE_INDICATOR: ${{ inputs.hide_location_indicator }}
           SMALL_BADGE: ${{ inputs.small_badge }}
           DEBUG_BANNER: ${{ inputs.debug_banner }}
         run: |
@@ -80,9 +90,14 @@ jobs:
 
           app_id = os.environ.get("APP_ID", "").strip()
           progress = os.environ.get("PROGRESS_TEXT", "false") == "true"
+          update_raw = os.environ.get("UPDATE_SECONDS", "5").strip() or "5"
+          if not update_raw.isdigit() or not (3 <= int(update_raw) <= 15):
+              sys.exit("ERROR: update_seconds must be a whole number from 3 to 15")
+          update_seconds = int(update_raw)
           max_alive = os.environ.get("MAX_KEEP_ALIVE", "false") == "true"
           small_badge = os.environ.get("SMALL_BADGE", "false") == "true"
           banner = os.environ.get("DEBUG_BANNER", "false") == "true"
+          hide_indicator = os.environ.get("HIDE_INDICATOR", "false") == "true"
           print("Custom app ID:", app_id or "(none, keeping original)")
           print("Progress:", progress, "| Max keep-alive:", max_alive, "| Small badge:", small_badge, "| Banner:", banner)
 
@@ -209,9 +224,9 @@ jobs:
                       s = sub(s, r'stateStr.size = Int(Int32(("by \(artist)").utf8.count))',
                               r'stateStr.size = Int(Int32(stateText.utf8.count))',
                               "progress text (size)")
-                      s = sub(s, "private let presenceUpdateInterval: TimeInterval = 15",
-                              "private let presenceUpdateInterval: TimeInterval = 5",
-                              "update every 5 seconds")
+                  s = sub(s, "private let presenceUpdateInterval: TimeInterval = 15",
+                          "private let presenceUpdateInterval: TimeInterval = " + str(update_seconds),
+                          "update every " + str(update_seconds) + " seconds")
 
                   if small_badge:
                       s = sub(s, "Discord_Activity_SetAssets(&activity, &assets)",
@@ -349,6 +364,10 @@ jobs:
               func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {}
           }
           '''
+
+              if max_alive and hide_indicator:
+                  b = sub(b, "m.showsBackgroundLocationIndicator = true", "m.showsBackgroundLocationIndicator = false", "hide location indicator")
+                  b = sub(b, "self.manager?.requestWhenInUseAuthorization()", "self.manager?.requestAlwaysAuthorization()", "request Always location access")
 
               open(bg, "w", encoding="utf-8").write(b)
           else:
